@@ -1,0 +1,7 @@
+# Local configuration (may contain MQVPN_AUTH_KEY)
+.env
+# Never commit certificates or keys
+tls/*
+!tls/README.md
+*.pem
+*.key

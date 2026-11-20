@@ -1,0 +1,118 @@
+# mqvpn server (Multipath QUIC VPN) for Docker Compose / Dokploy.
+#
+# All settings come from .env (Dokploy: the "Environment" tab). Every
+# variable has a safe default, so `docker compose up -d --build` works with an
+# empty .env. See .env.example and README.md.
+#
+# Dokploy notes:
+#   * Deploy as a "Docker Compose" service. Do NOT add a domain and keep
+#     "Isolated Deployment" OFF: both attach networks, which cannot be combined
+#     with network_mode: host. Traefik is not involved (it cannot proxy this
+#     UDP/QUIC VPN).
+#   * Dokploy's Traefik publishes UDP 443 (HTTP/3). If the logs report a port
+#     conflict, set MQVPN_PORT (e.g. 8443). See README "Port conflicts".
+
+services:
+  mqvpn:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        MQVPN_VERSION: ${MQVPN_VERSION:-0.19.2}
+        MQVPN_BUILD_METHOD: ${MQVPN_BUILD_METHOD:-release}
+        MQVPN_SHA256_AMD64: ${MQVPN_SHA256_AMD64:-d337086464b04ae90653a2a4402aa56f19fb001dcea60d0eb4e404d1e4bba863}
+        MQVPN_SHA256_ARM64: ${MQVPN_SHA256_ARM64:-a4b7dfe9510a949c7d9cd81679071589c6d2efea2dfd735623f5cadc8abd6c5a}
+        MQVPN_GIT_COMMIT: ${MQVPN_GIT_COMMIT:-74e2cd09b1cc811902e795a597390ceef503ad7e}
+    # Always build locally; never try to pull an image with this name.
+    pull_policy: build
+    restart: unless-stopped
+
+    # The VPN needs the host's network namespace: it creates the TUN device
+    # there, receives UDP directly on the host's public address (no Docker
+    # port proxy/NAT in front of QUIC multipath) and forwards client traffic
+    # out of the host's uplink.
+    network_mode: host
+    devices:
+      - /dev/net/tun:/dev/net/tun
+
+    # Least privilege: start from nothing and add only what is needed.
+    #   NET_ADMIN        TUN device, addresses, iptables, socket buffers
+    #   NET_RAW          iptables-legacy (hosts that still use it)
+    #   NET_BIND_SERVICE UDP ports below 1024 (default 443)
+    #   SETUID, SETGID   drop to the unprivileged 'mqvpn' user
+    #   CHOWN            hand /dev/net/tun and the config to that user
+    #   KILL             signal the mqvpn process (runs as another uid)
+    # mqvpn itself runs as 'mqvpn' with only NET_ADMIN + NET_BIND_SERVICE.
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+      - NET_BIND_SERVICE
+      - SETUID
+      - SETGID
+      - CHOWN
+      - KILL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /run:mode=0755,size=16m
+      - /tmp:mode=1777,size=16m
+
+    environment:
+      MQVPN_PORT: ${MQVPN_PORT:-443}
+      MQVPN_LISTEN_ADDR: ${MQVPN_LISTEN_ADDR:-0.0.0.0}
+      MQVPN_PUBLIC_HOST: ${MQVPN_PUBLIC_HOST:-}
+      MQVPN_SUBNET: ${MQVPN_SUBNET:-10.70.0.0/24}
+      MQVPN_SUBNET6: ${MQVPN_SUBNET6:-auto}
+      MQVPN_TUN_NAME: ${MQVPN_TUN_NAME:-mqvpn0}
+      MQVPN_MTU: ${MQVPN_MTU:-}
+      MQVPN_MAX_CLIENTS: ${MQVPN_MAX_CLIENTS:-64}
+      MQVPN_LOG_LEVEL: ${MQVPN_LOG_LEVEL:-info}
+      MQVPN_AUTH_KEY: ${MQVPN_AUTH_KEY:-}
+      MQVPN_GLOBAL_KEY: ${MQVPN_GLOBAL_KEY:-true}
+      MQVPN_USERS: ${MQVPN_USERS:-}
+      MQVPN_TLS_CERT_FILE: ${MQVPN_TLS_CERT_FILE:-}
+      MQVPN_TLS_KEY_FILE: ${MQVPN_TLS_KEY_FILE:-}
+      MQVPN_SCHEDULER: ${MQVPN_SCHEDULER:-wlb}
+      MQVPN_ALLOW_CLIENT_SCHEDULER: ${MQVPN_ALLOW_CLIENT_SCHEDULER:-true}
+      MQVPN_CC: ${MQVPN_CC:-bbr2}
+      MQVPN_REINJECTION: ${MQVPN_REINJECTION:-off}
+      MQVPN_HYBRID: ${MQVPN_HYBRID:-true}
+      MQVPN_REORDER: ${MQVPN_REORDER:-true}
+      MQVPN_CONTROL_PORT: ${MQVPN_CONTROL_PORT:-19090}
+      MQVPN_NAT_INTERFACE: ${MQVPN_NAT_INTERFACE:-auto}
+      MQVPN_BLOCK_PRIVATE_NETWORKS: ${MQVPN_BLOCK_PRIVATE_NETWORKS:-true}
+      MQVPN_FIREWALL_OPEN_PORT: ${MQVPN_FIREWALL_OPEN_PORT:-false}
+      MQVPN_IPTABLES_BACKEND: ${MQVPN_IPTABLES_BACKEND:-auto}
+      MQVPN_SKIP_SUBNET_CHECK: ${MQVPN_SKIP_SUBNET_CHECK:-false}
+
+    volumes:
+      # Auth key(s), self-signed certificate, IPv6 prefix and optional
+      # server.extra.conf. Survives redeploys and container re-creation.
+      - mqvpn-data:/etc/mqvpn
+      # Writable view of the host's net.* sysctls (/proc/sys is read-only in
+      # containers): IP forwarding and the TUN's accept_local. Writing them
+      # needs NET_ADMIN, which the container has anyway.
+      - /proc/sys/net:/host/proc/sys/net
+      # Optional certificate directory, e.g. MQVPN_TLS_HOST_DIR=/etc/letsencrypt
+      # with MQVPN_TLS_CERT_FILE=/etc/mqvpn-tls/live/vpn.example.com/fullchain.pem
+      - ${MQVPN_TLS_HOST_DIR:-./tls}:/etc/mqvpn-tls:ro
+
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/mqvpn-healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    # Time for mqvpn to close sessions and for the firewall cleanup.
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  mqvpn-data:
